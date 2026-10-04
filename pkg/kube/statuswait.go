@@ -163,7 +163,8 @@ func (w *statusWaiter) waitForDelete(ctx context.Context, resourceList ResourceL
 		RESTScopeStrategy: watcher.RESTScopeNamespace,
 	})
 	statusCollector := collector.NewResourceStatusCollector(resources)
-	check := w.deleteStatusCheck(cancelCtx, cancel)
+	confirmed := newDeleteConfirmations()
+	check := w.deleteStatusCheck(cancelCtx, cancel, confirmed)
 	done := statusCollector.ListenWithObserver(eventCh, collector.ObserverFunc(func(rsc *collector.ResourceStatusCollector, _ event.Event) {
 		// The collector goroutine is the only writer and runs this callback,
 		// so the map can be read without the collector's lock.
@@ -173,7 +174,7 @@ func (w *statusWaiter) waitForDelete(ctx context.Context, resourceList ResourceL
 		}
 		check(statuses)
 	}))
-	go w.recheckDeletes(cancelCtx, statusCollector, check)
+	go w.confirmDeletes(cancelCtx, statusCollector, check, confirmed)
 	<-done
 
 	if statusCollector.Error != nil {
@@ -297,40 +298,27 @@ func statusObserver(cancel context.CancelFunc, desired status.Status, logger *sl
 // initial LIST; waiting for a real status event would hang until the timeout
 // for resources that are already gone (#32214).
 //
-// The check therefore confirms a resource still reporting Unknown with a live
-// lookup: NotFound confirms the deletion, while anything else keeps the wait
-// running. It runs on every watcher event and on a timer, and does not wait for
-// the watcher's Sync event, which never arrives while an informer keeps
-// retrying a failed initial list. Lookups stop at the first resource the lookup
-// does not confirm gone, so a check costs at most one lookup beyond those that
-// confirm a deletion.
-func (w *statusWaiter) deleteStatusCheck(ctx context.Context, cancel context.CancelFunc) func([]*event.ResourceStatus) {
+// A resource still reporting Unknown is therefore confirmed with a live lookup
+// by confirmDeletes: NotFound confirms the deletion, while anything else keeps
+// the wait running. Confirmation does not wait for the watcher's Sync event,
+// which never arrives while an informer keeps retrying a failed initial list.
+//
+// This check itself never looks anything up, so it is cheap enough to run on
+// the collector's event goroutine, which cli-utils requires to return quickly.
+func (w *statusWaiter) deleteStatusCheck(ctx context.Context, cancel context.CancelFunc, confirmed *deleteConfirmations) func([]*event.ResourceStatus) {
 	desired := status.NotFoundStatus
-	var mu sync.Mutex
-	confirmedGone := map[object.ObjMetadata]bool{}
 	return func(statuses []*event.ResourceStatus) {
-		mu.Lock()
-		defer mu.Unlock()
 		if ctx.Err() != nil {
 			return
 		}
-		lookup := true
 		var rss []*event.ResourceStatus
 		var nonDesiredResources []*event.ResourceStatus
 		for _, rs := range statuses {
 			if rs == nil {
 				continue
 			}
-			if rs.Status == status.UnknownStatus {
-				if lookup && !confirmedGone[rs.Identifier] {
-					confirmedGone[rs.Identifier] = w.isResourceGone(ctx, rs.Identifier)
-					// A resource not confirmed gone keeps the wait running, so
-					// further lookups can't complete it on this check.
-					lookup = confirmedGone[rs.Identifier]
-				}
-				if confirmedGone[rs.Identifier] {
-					continue
-				}
+			if rs.Status == status.UnknownStatus && confirmed.gone(rs.Identifier) {
+				continue
 			}
 			rss = append(rss, rs)
 			if rs.Status != desired {
@@ -348,10 +336,45 @@ func (w *statusWaiter) deleteStatusCheck(ctx context.Context, cancel context.Can
 	}
 }
 
-// recheckDeletes runs check on a timer until ctx is done, so a lookup that
-// failed is retried, and resources that are already gone are confirmed, even
-// when the watcher has nothing new to report.
-func (w *statusWaiter) recheckDeletes(ctx context.Context, statusCollector *collector.ResourceStatusCollector, check func([]*event.ResourceStatus)) {
+// deleteConfirmations records which resources a live lookup has confirmed
+// absent from the cluster. Lookups happen on confirmDeletes' goroutine and the
+// results are read by the collector's event goroutine, so access is guarded,
+// but the lock is never held across a lookup.
+type deleteConfirmations struct {
+	mu   sync.Mutex
+	done map[object.ObjMetadata]bool
+}
+
+func newDeleteConfirmations() *deleteConfirmations {
+	return &deleteConfirmations{done: map[object.ObjMetadata]bool{}}
+}
+
+func (c *deleteConfirmations) gone(id object.ObjMetadata) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.done[id]
+}
+
+func (c *deleteConfirmations) set(id object.ObjMetadata, gone bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.done[id] = gone
+}
+
+// confirmDeletes owns the live lookups for a delete wait. It confirms once
+// immediately, so resources that are already gone complete the wait without
+// waiting for a tick, and then on every tick until ctx is done, so a lookup
+// that failed is retried and resources that are already gone are confirmed
+// even when the watcher has nothing new to report.
+//
+// Lookups run here, on their own goroutine and at most one round per interval,
+// rather than inline on the collector's event goroutine: an event that would
+// complete the wait must not sit in the queue behind an API call, and a
+// resource whose informer never reports must not cost one lookup per event.
+// Lookups stop at the first resource not confirmed gone, since the wait cannot
+// complete while that resource is unconfirmed, so a round costs at most one
+// lookup beyond those that confirm a deletion.
+func (w *statusWaiter) confirmDeletes(ctx context.Context, statusCollector *collector.ResourceStatusCollector, check func([]*event.ResourceStatus), confirmed *deleteConfirmations) {
 	interval := w.deleteRecheckInterval
 	if interval <= 0 {
 		interval = defaultDeleteRecheckInterval
@@ -359,11 +382,25 @@ func (w *statusWaiter) recheckDeletes(ctx context.Context, statusCollector *coll
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		statuses := statusCollector.LatestObservation().ResourceStatuses
+		for _, rs := range statuses {
+			if ctx.Err() != nil {
+				return
+			}
+			if rs == nil || rs.Status != status.UnknownStatus || confirmed.gone(rs.Identifier) {
+				continue
+			}
+			gone := w.isResourceGone(ctx, rs.Identifier)
+			confirmed.set(rs.Identifier, gone)
+			if !gone {
+				break
+			}
+		}
+		check(statuses)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			check(statusCollector.LatestObservation().ResourceStatuses)
 		}
 	}
 }

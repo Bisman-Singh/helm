@@ -2085,3 +2085,100 @@ func TestWatchUntilReadyWithCustomReaders(t *testing.T) {
 		})
 	}
 }
+
+// TestStatusWaitForDeleteLookupsDoNotBlockEvents covers the cost of confirming
+// deletions with live lookups. cli-utils calls the collector's observer on the
+// goroutine that processes watcher events and documents that the callback must
+// return quickly, so a lookup made from there holds up every other resource:
+// an event that would complete the wait waits for the API call to finish. A
+// resource that keeps reporting Unknown is also never confirmed, so looking it
+// up per event turns watcher churn into one API call each.
+func TestStatusWaitForDeleteLookupsDoNotBlockEvents(t *testing.T) {
+	t.Parallel()
+	notFound := func(id object.ObjMetadata) event.Event {
+		return event.Event{
+			Type: event.ResourceUpdateEvent,
+			Resource: &event.ResourceStatus{
+				Identifier: id,
+				Status:     status.NotFoundStatus,
+			},
+		}
+	}
+
+	t.Run("an event completing the wait is not queued behind a slow lookup", func(t *testing.T) {
+		t.Parallel()
+		timeout := 10 * time.Second
+		lookupDelay := 2 * time.Second
+		c := newTestClient(t)
+		fakeClient := dynamicfake.NewSimpleDynamicClient(scheme.Scheme)
+		fakeMapper := testutil.NewFakeRESTMapper(
+			v1.SchemeGroupVersion.WithKind("Pod"),
+			batchv1.SchemeGroupVersion.WithKind("Job"),
+		)
+		fakeClient.PrependReactor("get", "jobs", func(_ clienttesting.Action) (bool, runtime.Object, error) {
+			time.Sleep(lookupDelay)
+			return false, nil, nil
+		})
+		statusWaiter := statusWaiter{restMapper: fakeMapper, client: fakeClient}
+		statusWaiter.SetLogger(slog.Default().Handler())
+		// Neither object is created: both were deleted before the wait started.
+		objs := getRuntimeObjFromManifests(t, []string{podCurrentManifest, jobNoStatusManifest})
+		podID, err := object.RuntimeToObjMeta(objs[0].(*unstructured.Unstructured))
+		require.NoError(t, err)
+		jobID, err := object.RuntimeToObjMeta(objs[1].(*unstructured.Unstructured))
+		require.NoError(t, err)
+		sw := &scriptedStatusWatcher{events: []event.Event{notFound(podID), notFound(jobID)}}
+		resourceList := getResourceListFromRuntimeObjs(t, c, objs)
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		start := time.Now()
+		err = statusWaiter.waitForDelete(ctx, resourceList, sw)
+		elapsed := time.Since(start)
+		require.NoError(t, err)
+		assert.Less(t, elapsed, lookupDelay/2, "the queued NotFound event completing the wait was held up by a lookup")
+	})
+
+	t.Run("a resource that keeps reporting Unknown is looked up per interval, not per event", func(t *testing.T) {
+		t.Parallel()
+		timeout := time.Second
+		recheck := 250 * time.Millisecond
+		c := newTestClient(t)
+		fakeClient := dynamicfake.NewSimpleDynamicClient(scheme.Scheme)
+		fakeMapper := testutil.NewFakeRESTMapper(
+			v1.SchemeGroupVersion.WithKind("Pod"),
+			batchv1.SchemeGroupVersion.WithKind("Job"),
+		)
+		statusWaiter := statusWaiter{
+			restMapper:            fakeMapper,
+			client:                fakeClient,
+			deleteRecheckInterval: recheck,
+		}
+		statusWaiter.SetLogger(slog.Default().Handler())
+		objs := getRuntimeObjFromManifests(t, []string{podCurrentManifest, jobNoStatusManifest})
+		// The pod still exists and its informer never reports it, so it stays
+		// Unknown and no lookup can confirm it gone.
+		pod := objs[0].(*unstructured.Unstructured)
+		require.NoError(t, fakeClient.Tracker().Create(getGVR(t, fakeMapper, pod), pod, pod.GetNamespace()))
+		jobID, err := object.RuntimeToObjMeta(objs[1].(*unstructured.Unstructured))
+		require.NoError(t, err)
+		events := make([]event.Event, 0, 200)
+		for range 200 {
+			events = append(events, notFound(jobID))
+		}
+		sw := &scriptedStatusWatcher{events: events}
+		resourceList := getResourceListFromRuntimeObjs(t, c, objs)
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		err = statusWaiter.waitForDelete(ctx, resourceList, sw)
+		require.ErrorContains(t, err, "context deadline exceeded")
+		gets := 0
+		for _, action := range fakeClient.Actions() {
+			if action.GetVerb() == "get" {
+				gets++
+			}
+		}
+		assert.LessOrEqual(t, gets, int(timeout/recheck)+1, "lookups should be bounded by the recheck interval, not by the number of events")
+	})
+}
